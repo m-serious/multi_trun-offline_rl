@@ -1,0 +1,34 @@
+assignments:
+- agent: qwq-32b
+  task: alfworld-std
+concurrency:
+  agent:
+    qwq-32b: 5
+  task:
+    alfworld-std: 5
+definition:
+  agent:
+    qwq-32b:
+      module: src.client.agents.qwq_agent.QWQAgent
+      parameters:
+        api_args:
+          base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+          max_tokens: 4096
+          model: qwq-32b
+          temperature: 0.7
+        body:
+          max_tokens: 512
+          model: qwq-32b
+        name: qwq-32b
+  task:
+    alfworld-std:
+      module: src.client.TaskClient
+      parameters:
+        config_path: src/server/tasks/alfworld/configs/base_config.yaml
+        controller_address: http://localhost:5000/api
+        data_path: /AgentBench/data/alfworld
+        max_step: 35
+        name: alfworld-std
+        prompts_path: src/server/tasks/alfworld/prompts/alfworld_multiturn_long_thought.json
+        split: standard
+output: outputs/2025-05-23-11-34-39

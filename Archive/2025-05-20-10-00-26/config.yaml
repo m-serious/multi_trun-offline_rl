@@ -1,0 +1,45 @@
+assignments:
+- agent: qwq-32b
+  task: webshop-std
+- agent: qwq-32b
+  task: alfworld-std
+concurrency:
+  agent:
+    qwq-32b: 5
+  task:
+    alfworld-std: 5
+    webshop-std: 5
+definition:
+  agent:
+    qwq-32b:
+      module: src.client.agents.qwq_agent.QWQAgent
+      parameters:
+        api_args:
+          base_url: http://localhost:8001/v1
+          max_tokens: 4096
+          model: agent-llm
+          temperature: 0.7
+        body:
+          max_tokens: 512
+          model: qwq-32b
+        name: qwq-32b
+  task:
+    alfworld-std:
+      module: src.client.TaskClient
+      parameters:
+        config_path: src/server/tasks/alfworld/configs/base_config.yaml
+        controller_address: http://localhost:5000/api
+        data_path: /AgentBench/data/alfworld
+        max_step: 35
+        name: alfworld-std
+        prompts_path: src/server/tasks/alfworld/prompts/alfworld_multiturn_plan_first.json
+        split: standard
+    webshop-std:
+      module: src.client.TaskClient
+      parameters:
+        concurrency: 1
+        controller_address: http://localhost:5000/api
+        end: 200
+        name: webshop-std
+        start: 0
+output: outputs/2025-05-20-10-00-26
