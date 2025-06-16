@@ -274,7 +274,7 @@ class RLHFDataset(Dataset):
     
 
 import json
-class OfflineRLDataset(Dataset):
+class OfflineRLDataset_(Dataset):
     def __init__(self, data_files, tokenizer, processor, config, is_multi_turn, max_prompt_length, max_response_length):
         self.tokenizer = tokenizer
         self.processor = processor # if multimodal
@@ -369,6 +369,206 @@ class OfflineRLDataset(Dataset):
         # For now, returning the dict as is, assuming collate_fn handles padding.
         return self.data[idx]
 
+
+# =======  替换原 OfflineRLDataset =======
+from torch.utils.data import Dataset
+from typing import List, Union, Optional
+import json, torch, copy, itertools
+from transformers import PreTrainedTokenizer, ProcessorMixin
+import os
+
+# class OfflineRLDataset(Dataset):
+#     """
+#     专供离线 RL（PPO / ILQL / DT 等）使用的数据集。
+#     每个样本 = (prompt_tokens + response_tokens)，并携带
+#         - loss_mask      : 仅对 response 部分 =1
+#         - responses      : response_tokens（单独裁剪，供 compute_response_mask）
+#         - rewards        : scalar，trainer 会再分配到 token_level_scores
+#         - uid            : 行号，方便 debug 对齐
+#     适配 qwq32b.jsonl：
+#         record['output']['history']        -> trajectory list
+#         record['output']['result']['result'] == True/0 -> 终局成功标志
+#     """
+#     def __init__(
+#         self,
+#         data_files: Union[str, List[str]],
+#         tokenizer: PreTrainedTokenizer,
+#         config,
+#         processor: Optional[ProcessorMixin] = None,
+#         is_multi_turn: bool = True,
+#         max_prompt_length: int = 4096,
+#         max_response_length: int = 1024,
+#     ):
+#         super().__init__()
+#         if isinstance(data_files, str):
+#             data_files = [data_files]
+
+#         self.tokenizer = tokenizer
+#         self.processor = processor
+#         self.config = config
+#         self.is_multi_turn = is_multi_turn
+#         self.max_prompt_length = max_prompt_length
+#         self.max_response_length = max_response_length
+#         self.data = []
+
+#         uid = 0
+#         for fp in data_files:
+#             with open(fp) as f:
+#                 for line in f:
+#                     record = json.loads(line)
+#                     # ---------- 1️⃣ 抽 trajectory ----------
+#                     traj = (record.get("output", {})
+#                                    .get("result", {})
+#                                    .get("history", []))
+#                     if not traj:               # qwq32b 存在于这里
+#                         traj = record.get("output", {}).get("history", [])
+#                     if not traj:
+#                         continue               # 跳过异常行
+
+#                     # ---------- 2️⃣ reward ----------
+#                     scalar_reward = float(bool(
+#                         record.get("output", {})
+#                               .get("result", {})
+#                               .get("result", 0)
+#                     ))
+
+#                     # ---------- 3️⃣ 遍历 agent turn ----------
+#                     prompt_stack: list[str] = []
+#                     for turn in traj:
+#                         role, content = turn["role"], turn["content"]
+#                         if role == "user":
+#                             prompt_stack.append(content)
+#                         elif role == "agent":
+#                             obs_text  = "\n".join(prompt_stack)
+#                             act_text  = content
+#                             sample    = self._build_sample(
+#                                 obs_text, act_text, scalar_reward, uid)
+#                             self.data.append(sample)
+#                             uid += 1
+#                             prompt_stack.append(act_text)  # 更新上下文
+#                         # 其余角色忽略
+
+#     # -------------------------------------------------------
+#     def _build_sample(self, obs: str, act: str, rew: float, uid: int):
+#         """
+#         从 (obs, act) 文本对构造张量 dict.
+#         """
+#         # 1. tokenization
+#         obs_tok  = self.tokenizer(
+#             obs,
+#             add_special_tokens=False,
+#             truncation=True,
+#             max_length=self.max_prompt_length,
+#         )
+#         act_tok  = self.tokenizer(
+#             act,
+#             add_special_tokens=False,
+#             truncation=True,
+#             max_length=self.max_response_length,
+#         )
+
+#         input_ids       = obs_tok["input_ids"] + act_tok["input_ids"]
+#         attention_mask  = [1] * len(input_ids)
+#         loss_mask       = [0] * len(obs_tok["input_ids"]) + [1] * len(act_tok["input_ids"])
+
+#         return {
+#             "input_ids"  : torch.tensor(input_ids, dtype=torch.long),
+#             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+#             "loss_mask"  : torch.tensor(loss_mask, dtype=torch.long),
+#             "responses"  : torch.tensor(act_tok["input_ids"], dtype=torch.long),
+#             "rewards"    : torch.tensor([rew], dtype=torch.float),
+#             "uid"        : uid,                         # 非 tensor，collate_fn 会自动转成 np.array
+#         }
+
+#     # -------------------------------------------------------
+#     def __len__(self):  return len(self.data)
+#     def __getitem__(self, idx): return self.data[idx]
+
+
+class OfflineRLDataset(Dataset):
+    def __init__(self, data_files, tokenizer, max_prompt_length=4096, max_response_length=1024):
+        self.tokenizer = tokenizer
+        self.data = []
+        if isinstance(data_files, str):
+            data_files = [data_files]
+        print(f"[DEBUG] Loading {len(data_files)} files: {data_files}")
+
+        for fp in data_files:
+            try:
+                with open(fp, 'r', encoding='utf-8') as f:
+                    for idx, line in enumerate(f):
+                        try:
+                            record = json.loads(line.strip())
+                            traj = (record.get("output", {}).get("result", {}).get("history", [])
+                                    or record.get("output", {}).get("history", []))
+                            if not traj:
+                                print(f"[WARNING] Empty trajectory in {fp}:{idx}")
+                                continue
+
+                            prev_obs = None
+                            for turn_idx, turn in enumerate(traj):
+                                if not isinstance(turn, dict) or "role" not in turn or "content" not in turn:
+                                    print(f"[WARNING] Invalid turn format in {fp}:{idx}:{turn_idx}: {turn}")
+                                    continue
+                                if turn["role"] == "user":
+                                    prev_obs = turn["content"]
+                                elif turn["role"] == "agent" and prev_obs is not None:
+                                    act = turn["content"]
+                                    try:
+                                        rew = float(record.get("output", {}).get("result", {}).get("reward", 0.0))
+                                    except (TypeError, ValueError):
+                                        print(f"[WARNING] Invalid reward in {fp}:{idx}, defaulting to 0.0")
+                                        rew = 0.0
+                                    uid = f"{os.path.basename(fp)}_{idx}_{len(self.data)}"
+                                    self.data.append(self._build_sample(prev_obs, act, rew, uid))
+                                    prev_obs = None  # 在配对后重置
+                            if prev_obs is not None:
+                                print(f"[WARNING] Unpaired user observation in {fp}:{idx}: {prev_obs}")
+                        except json.JSONDecodeError:
+                            print(f"[WARNING] Skipping invalid JSON line in {fp}:{idx}: {line.strip()}")
+                            continue
+            except FileNotFoundError:
+                print(f"[ERROR] File not found: {fp}")
+                continue
+
+        print(f"[DEBUG] Loaded {len(self.data)} samples")
+        if not self.data:
+            raise ValueError(f"No valid samples loaded from {data_files}. Check data format or file content.")
+
+    def _build_sample(self, obs, act, reward, uid):
+        # 标记观察和动作
+        obs_tok = self.tokenizer(obs, truncation=True, add_special_tokens=False, max_length=4096)
+        act_tok = self.tokenizer(act, truncation=True, add_special_tokens=False, max_length=1024)
+        sep_tok = self.tokenizer(self.tokenizer.sep_token, add_special_tokens=False)["input_ids"]
+
+        # 结合 input_ids 和分隔符
+        input_ids = obs_tok["input_ids"] + sep_tok + act_tok["input_ids"]
+        attention = [1] * len(input_ids)
+        loss_mask = [0] * len(obs_tok["input_ids"]) + [0] * len(sep_tok) + [1] * len(act_tok["input_ids"])
+
+        # 确保总长度不超过模型限制
+        max_total_length = 4096
+        if len(input_ids) > max_total_length:
+            input_ids = input_ids[:max_total_length]
+            attention = attention[:max_total_length]
+            loss_mask = loss_mask[:max_total_length]
+
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention, dtype=torch.long),
+            "loss_mask": torch.tensor(loss_mask, dtype=torch.long),
+            "responses": torch.tensor(act_tok["input_ids"], dtype=torch.long),
+            "rewards": torch.tensor([reward], dtype=torch.float),
+            "uid": uid,
+        }
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+# =======  替换结束 =======
 
 
 # Important Considerations for OfflineRLDataset Implementation:

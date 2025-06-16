@@ -2,6 +2,7 @@ data:
   tokenizer: null
   train_files: ~/data/rlhf/gsm8k/train.parquet
   val_files: ~/data/rlhf/gsm8k/test.parquet
+  offline_train_files: /hdd/yxyang/multi_trun-offline_rl/qwq32b.jsonl
   prompt_key: prompt
   reward_fn_key: data_source
   max_prompt_length: 512
@@ -18,13 +19,14 @@ data:
   image_key: images
   video_key: videos
   custom_cls:
-      path: null
-      name: null
+    path: /hdd/yxyang/multi_trun-offline_rl/verl/utils/dataset/rl_dataset.py
+    name: OfflineRLDataset
+
 
 actor_rollout_ref:
   hybrid_engine: True
   model:
-    path: ~/models/deepseek-llm-7b-chat
+    path: /hdd/yxyang/OpenManus-RL-main/Qwen2.5-3B
     external_lib: null
     override_config: { }
     enable_gradient_checkpointing: True
@@ -34,6 +36,7 @@ actor_rollout_ref:
     use_fused_kernels: False
     trust_remote_code: False
   actor:
+    micro_batch_size: 1
     strategy: fsdp  # [fsdp, fsdp2], This is for backward-compatibility
     ppo_mini_batch_size: 256
     ppo_micro_batch_size: null # will be deprecated, use ppo_micro_batch_size_per_gpu

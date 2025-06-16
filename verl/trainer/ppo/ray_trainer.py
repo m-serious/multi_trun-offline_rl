@@ -346,6 +346,13 @@ class RayPPOTrainer:
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
+        if self.is_offline_mode:
+            # Minimum offline safety check（可根据实际需要保留一些）
+            assert config.data.train_batch_size >= config.actor_rollout_ref.actor.ppo_mini_batch_size, \
+                f"train_batch_size ({config.data.train_batch_size}) must ≥ ppo_mini_batch_size ({config.actor_rollout_ref.actor.ppo_mini_batch_size})"
+            print("[validate_config] Offline mode: skipped online-specific validation.")
+            return
+    
         # 1. Check total batch size for data correctness
         if not self.is_offline_mode: # Online mode checks
             real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
@@ -465,9 +472,9 @@ class RayPPOTrainer:
         from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
         if train_dataset is None:
-            train_dataset = create_rl_dataset(self.config.data.train_files, self.config.data, self.tokenizer, self.processor)
+            train_dataset = create_offline_rl_dataset(self.config.data.offline_train_files, self.config.data, self.tokenizer, self.processor)
         if val_dataset is None:
-            val_dataset = create_rl_dataset(self.config.data.val_files, self.config.data, self.tokenizer, self.processor)
+            val_dataset = create_offline_rl_dataset(self.config.data.offline_train_files, self.config.data, self.tokenizer, self.processor)
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
         if train_sampler is None:

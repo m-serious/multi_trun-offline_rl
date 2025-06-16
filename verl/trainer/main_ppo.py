@@ -22,6 +22,8 @@ import ray
 
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
+# verl/trainer/main_ppo.py
+
 import json # Added
 
 def get_custom_reward_fn(config):
@@ -182,8 +184,8 @@ class TaskRunner:
         from verl.utils.dataset.rl_dataset import collate_fn
 
         if is_offline_mode:
-            train_dataset = create_offline_rl_dataset(config.data.offline_train_files, config.data, tokenizer, processor, is_multi_turn=config.actor_rollout_ref.rollout.multi_turn.enable)
-            val_dataset = create_offline_rl_dataset(config.data.offline_val_files, config.data, tokenizer, processor, is_multi_turn=config.actor_rollout_ref.rollout.multi_turn.enable) if config.data.get("offline_val_files") else None
+            train_dataset = create_offline_rl_dataset(config.data.offline_train_files, config.data, tokenizer, processor)
+            val_dataset = create_offline_rl_dataset(config.data.offline_val_files, config.data, tokenizer, processor) if config.data.get("offline_val_files") else None
         else:
             train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
             val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
@@ -235,7 +237,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor):
     print(f"Using dataset class: {dataset_cls.__name__}")
 
     dataset = dataset_cls(
-        data_files=data_paths,
+        data_files= data_paths,
         tokenizer=tokenizer,
         processor=processor,
         config=data_config,
@@ -243,7 +245,8 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor):
 
     return dataset
 
-def create_offline_rl_dataset(data_paths, data_config, tokenizer, processor, is_multi_turn=False):
+
+def create_offline_rl_dataset(data_files, data_config, tokenizer, processor):
     """Create an offline dataset from pre-generated files."""
     from torch.utils.data import Dataset
     # You'll need to implement/place OfflineRLDataset appropriately
@@ -252,18 +255,22 @@ def create_offline_rl_dataset(data_paths, data_config, tokenizer, processor, is_
         from verl.utils.dataset.rl_dataset import OfflineRLDataset 
     except ImportError:
         raise ImportError("OfflineRLDataset not found. Please implement it.")
+    
+    # 设置默认 sep_token（如果未定义）
+    if not hasattr(tokenizer, 'sep_token') or tokenizer.sep_token is None:
+        tokenizer.sep_token = "[SEP]"  # 或其他适合您的模型的分隔符
+        tokenizer.add_special_tokens({'sep_token': '[SEP]'})
+        print(f"[INFO] Set sep_token to {tokenizer.sep_token}")
 
     print(f"Using OfflineRLDataset for offline RL.")
     dataset = OfflineRLDataset(
-        data_files=data_paths,
+        data_files=data_files,
         tokenizer=tokenizer,
-        processor=processor,
-        config=data_config,
-        is_multi_turn=is_multi_turn,
         max_prompt_length=data_config.max_prompt_length,
         max_response_length=data_config.max_response_length
     )
     return dataset
+
 
 def create_rl_sampler(data_config, dataset):
     """Create a sampler for the dataset.
