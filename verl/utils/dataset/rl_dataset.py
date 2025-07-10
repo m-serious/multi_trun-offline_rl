@@ -486,78 +486,182 @@ import os
 
 
 class OfflineRLDataset(Dataset):
+    """
+    Offline Reinforcement Learning Dataset for processing pre-collected trajectory data.
+    
+    This dataset is specifically designed for offline RL training where we learn from
+    fixed trajectory data without online environment interaction.
+    
+    Data Format Requirements:
+    - JSONL format with one JSON object per line
+    - Each record contains trajectory history and reward information
+    - Supports multi-turn conversation format
+    - Automatically generates loss_mask for multi-turn training
+    
+    Args:
+        data_files (str or List[str]): Path(s) to offline trajectory data files
+        tokenizer: HuggingFace tokenizer instance
+        max_prompt_length (int): Maximum length for prompt/observation tokens
+        max_response_length (int): Maximum length for response/action tokens
+    """
     def __init__(self, data_files, tokenizer, max_prompt_length=4096, max_response_length=1024):
         self.tokenizer = tokenizer
+        self.max_prompt_length = max_prompt_length
+        self.max_response_length = max_response_length
         self.data = []
+        
+        # Ensure sep_token exists for separating prompt and response
+        if not hasattr(tokenizer, 'sep_token') or tokenizer.sep_token is None:
+            tokenizer.sep_token = "[SEP]"
+            tokenizer.add_special_tokens({'sep_token': '[SEP]'})
+            print(f"[INFO] Set sep_token to: {tokenizer.sep_token}")
+        
         if isinstance(data_files, str):
             data_files = [data_files]
-        print(f"[DEBUG] Loading {len(data_files)} files: {data_files}")
-
+        
+        print(f"[INFO] Loading {len(data_files)} offline data files: {data_files}")
+        
         for fp in data_files:
-            try:
-                with open(fp, 'r', encoding='utf-8') as f:
-                    for idx, line in enumerate(f):
-                        try:
-                            record = json.loads(line.strip())
-                            traj = (record.get("output", {}).get("result", {}).get("history", [])
-                                    or record.get("output", {}).get("history", []))
-                            if not traj:
-                                print(f"[WARNING] Empty trajectory in {fp}:{idx}")
-                                continue
-
-                            prev_obs = None
-                            for turn_idx, turn in enumerate(traj):
-                                if not isinstance(turn, dict) or "role" not in turn or "content" not in turn:
-                                    print(f"[WARNING] Invalid turn format in {fp}:{idx}:{turn_idx}: {turn}")
-                                    continue
-                                if turn["role"] == "user":
-                                    prev_obs = turn["content"]
-                                elif turn["role"] == "agent" and prev_obs is not None:
-                                    act = turn["content"]
-                                    try:
-                                        rew = float(record.get("output", {}).get("result", {}).get("reward", 0.0))
-                                    except (TypeError, ValueError):
-                                        print(f"[WARNING] Invalid reward in {fp}:{idx}, defaulting to 0.0")
-                                        rew = 0.0
-                                    uid = f"{os.path.basename(fp)}_{idx}_{len(self.data)}"
-                                    self.data.append(self._build_sample(prev_obs, act, rew, uid))
-                                    prev_obs = None  # 在配对后重置
-                            if prev_obs is not None:
-                                print(f"[WARNING] Unpaired user observation in {fp}:{idx}: {prev_obs}")
-                        except json.JSONDecodeError:
-                            print(f"[WARNING] Skipping invalid JSON line in {fp}:{idx}: {line.strip()}")
-                            continue
-            except FileNotFoundError:
+            if not os.path.exists(fp):
                 print(f"[ERROR] File not found: {fp}")
                 continue
-
-        print(f"[DEBUG] Loaded {len(self.data)} samples")
+                
+            self._load_file(fp)
+        
+        print(f"[INFO] Successfully loaded {len(self.data)} training samples")
+        
         if not self.data:
-            raise ValueError(f"No valid samples loaded from {data_files}. Check data format or file content.")
+            raise ValueError(f"No valid samples loaded from {data_files}. Please check data format and file content.")
 
-    def _build_sample(self, obs, act, reward, uid):
-        # 标记观察和动作
-        obs_tok = self.tokenizer(obs, truncation=True, add_special_tokens=False, max_length=4096)
-        act_tok = self.tokenizer(act, truncation=True, add_special_tokens=False, max_length=1024)
-        sep_tok = self.tokenizer(self.tokenizer.sep_token, add_special_tokens=False)["input_ids"]
+    def _load_file(self, filepath):
+        """Load and parse trajectory data from a single file."""
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                for line_idx, line in enumerate(f):
+                    try:
+                        record = json.loads(line.strip())
+                        self._process_record(record, filepath, line_idx)
+                    except json.JSONDecodeError as e:
+                        print(f"[WARNING] Skipping invalid JSON line {filepath}:{line_idx}: {e}")
+                        continue
+        except FileNotFoundError:
+            print(f"[ERROR] File not found: {filepath}")
 
-        # 结合 input_ids 和分隔符
-        input_ids = obs_tok["input_ids"] + sep_tok + act_tok["input_ids"]
-        attention = [1] * len(input_ids)
-        loss_mask = [0] * len(obs_tok["input_ids"]) + [0] * len(sep_tok) + [1] * len(act_tok["input_ids"])
+    def _process_record(self, record, filepath, line_idx):
+        """Process a single record to extract trajectory and reward information."""
+        # Extract trajectory data - support multiple data formats
+        trajectory = (
+            record.get("output", {}).get("result", {}).get("history", []) or
+            record.get("output", {}).get("history", []) or
+            record.get("history", []) or
+            []
+        )
+        
+        if not trajectory:
+            print(f"[WARNING] Empty trajectory {filepath}:{line_idx}")
+            return
+        
+        # Extract reward value - support multiple reward fields
+        reward = self._extract_reward(record)
+        
+        # Parse user-agent conversation pairs from trajectory
+        conversation_pairs = self._extract_conversation_pairs(trajectory)
+        
+        # Create training samples for each conversation pair
+        for pair_idx, (user_msg, agent_msg) in enumerate(conversation_pairs):
+            uid = f"{os.path.basename(filepath)}_{line_idx}_{pair_idx}"
+            sample = self._build_sample(user_msg, agent_msg, reward, uid)
+            self.data.append(sample)
 
-        # 确保总长度不超过模型限制
-        max_total_length = 4096
+    def _extract_reward(self, record):
+        """Extract reward value, supporting multiple reward formats."""
+        try:
+            # Try different reward field sources
+            reward_sources = [
+                record.get("output", {}).get("result", {}).get("reward"),
+                record.get("output", {}).get("result", {}).get("result"),
+                record.get("reward"),
+                record.get("score")
+            ]
+            
+            for reward in reward_sources:
+                if reward is not None:
+                    return float(reward)
+            
+            # If no explicit reward, use success flag
+            success = record.get("output", {}).get("result", {}).get("success", False)
+            return 1.0 if success else 0.0
+            
+        except (TypeError, ValueError):
+            print(f"[WARNING] Invalid reward value, using default 0.0")
+            return 0.0
+
+    def _extract_conversation_pairs(self, trajectory):
+        """Extract user-agent conversation pairs from trajectory."""
+        pairs = []
+        current_user_msg = None
+        
+        for turn in trajectory:
+            if not isinstance(turn, dict) or "role" not in turn or "content" not in turn:
+                continue
+                
+            role = turn["role"]
+            content = turn["content"]
+            
+            if role == "user":
+                current_user_msg = content
+            elif role == "agent" and current_user_msg is not None:
+                pairs.append((current_user_msg, content))
+                current_user_msg = None  # Reset after pairing
+        
+        return pairs
+
+    def _build_sample(self, user_msg, agent_msg, reward, uid):
+        """Build a single training sample from user message and agent response."""
+        # Tokenize user message and agent response separately
+        user_tokens = self.tokenizer(
+            user_msg, 
+            truncation=True, 
+            add_special_tokens=False, 
+            max_length=self.max_prompt_length
+        )
+        
+        agent_tokens = self.tokenizer(
+            agent_msg, 
+            truncation=True, 
+            add_special_tokens=False, 
+            max_length=self.max_response_length
+        )
+        
+        # Get separator tokens
+        sep_tokens = self.tokenizer(
+            self.tokenizer.sep_token, 
+            add_special_tokens=False
+        )["input_ids"]
+        
+        # Combine input_ids: [user_tokens] + [SEP] + [agent_tokens]
+        input_ids = user_tokens["input_ids"] + sep_tokens + agent_tokens["input_ids"]
+        attention_mask = [1] * len(input_ids)
+        
+        # loss_mask: compute loss only on agent response tokens
+        loss_mask = (
+            [0] * len(user_tokens["input_ids"]) +     # No loss on user tokens
+            [0] * len(sep_tokens) +                   # No loss on separator tokens  
+            [1] * len(agent_tokens["input_ids"])      # Compute loss on agent tokens
+        )
+        
+        # Ensure total length doesn't exceed maximum
+        max_total_length = self.max_prompt_length + self.max_response_length
         if len(input_ids) > max_total_length:
             input_ids = input_ids[:max_total_length]
-            attention = attention[:max_total_length]
+            attention_mask = attention_mask[:max_total_length]
             loss_mask = loss_mask[:max_total_length]
-
+        
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "loss_mask": torch.tensor(loss_mask, dtype=torch.long),
-            "responses": torch.tensor(act_tok["input_ids"], dtype=torch.long),
+            "responses": torch.tensor(agent_tokens["input_ids"], dtype=torch.long),
             "rewards": torch.tensor([reward], dtype=torch.float),
             "uid": uid,
         }

@@ -74,7 +74,7 @@ def run_ppo(config) -> None:
             num_cpus=config.ray_init.num_cpus,
         )
 
-    # Add a check for offline mode based on config
+    # Check for offline mode configuration
     is_offline_mode = config.trainer.get("offline_mode", False)
     if is_offline_mode:
         print("INFO: Running in OFFLINE RL mode.")
@@ -121,9 +121,8 @@ class TaskRunner:
             from verl.single_controller.ray import RayWorkerGroup
             from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
 
-            # In offline mode, async rollout is not directly applicable for training data generation
-            # but the worker class might still be used if evaluation is online.
-            # For simplicity, we might not need AsyncActorRolloutRefWorker if fully offline.
+            # In offline mode, async rollout is primarily used for validation rather than training data generation
+            # For training, we use actions from the offline dataset directly
             actor_rollout_cls = ActorRolloutRefWorker
             if not is_offline_mode and config.actor_rollout_ref.rollout.mode == "async":
                  actor_rollout_cls = AsyncActorRolloutRefWorker
@@ -256,9 +255,9 @@ def create_offline_rl_dataset(data_files, data_config, tokenizer, processor):
     except ImportError:
         raise ImportError("OfflineRLDataset not found. Please implement it.")
     
-    # 设置默认 sep_token（如果未定义）
+    # Set default sep_token if not defined
     if not hasattr(tokenizer, 'sep_token') or tokenizer.sep_token is None:
-        tokenizer.sep_token = "[SEP]"  # 或其他适合您的模型的分隔符
+        tokenizer.sep_token = "[SEP]"  # Or other separator suitable for your model
         tokenizer.add_special_tokens({'sep_token': '[SEP]'})
         print(f"[INFO] Set sep_token to {tokenizer.sep_token}")
 

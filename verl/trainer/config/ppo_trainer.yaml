@@ -1,8 +1,11 @@
 data:
   tokenizer: null
+  # Online RL data files (for online mode)
   train_files: ~/data/rlhf/gsm8k/train.parquet
   val_files: ~/data/rlhf/gsm8k/test.parquet
-  offline_train_files: /hdd/yxyang/multi_trun-offline_rl/qwq32b.jsonl
+  # Offline RL data files (for offline mode)
+  offline_train_files: null  # Example: /path/to/offline_trajectories.jsonl
+  offline_val_files: null    # Example: /path/to/offline_validation.jsonl
   prompt_key: prompt
   reward_fn_key: data_source
   max_prompt_length: 512
@@ -18,9 +21,10 @@ data:
   truncation: error
   image_key: images
   video_key: videos
+  # Offline RL custom dataset class configuration
   custom_cls:
-    path: /hdd/yxyang/multi_trun-offline_rl/verl/utils/dataset/rl_dataset.py
-    name: OfflineRLDataset
+    path: null  # Example: verl/utils/dataset/rl_dataset.py
+    name: null  # Example: OfflineRLDataset
 
 
 actor_rollout_ref:
@@ -220,7 +224,7 @@ custom_reward_function:
 algorithm:
   gamma: 1.0
   lam: 1.0
-  adv_estimator: gae
+  adv_estimator: gae  # Recommended for offline RL: grpo, reinforce_plus_plus
   norm_adv_by_std_in_grpo: True
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence
@@ -229,8 +233,14 @@ algorithm:
     kl_coef: 0.001
     horizon: 10000
     target_kl: 0.1
+  # 🎯 Offline RL specific parameters
+  offline_rl:
+    behavior_cloning_coef: 0.0    # Behavior cloning loss coefficient (for conservative policy updates)
+    importance_sampling_clip: 2.0  # Importance sampling clipping threshold
 
 trainer:
+  # 🎯 Offline RL mode switch
+  offline_mode: false  # true: Offline RL mode, false: Online RL mode
   balance_batch: True
   total_epochs: 30
   total_training_steps: null

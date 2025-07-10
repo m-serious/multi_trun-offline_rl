@@ -1,0 +1,179 @@
+# Configuration for Offline Reinforcement Learning (Offline RL) with PPO
+# This configuration is specifically designed for training policies from pre-collected trajectory data
+# without online environment interaction.
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# 🎯 OFFLINE RL MODE ENABLED
+trainer:
+  offline_mode: true  # Enable offline RL mode
+  
+  # Validation and checkpointing settings for offline training
+  test_freq: 100     # Frequency of validation evaluation
+  save_freq: 500     # Frequency of model checkpointing
+  total_epochs: 10   # Reduced epochs for offline training
+  
+  # Conservative training settings for offline RL
+  critic_warmup: 0   # Number of critic warmup steps
+
+# Dataset configuration for offline training
+data:
+  # 🎯 OFFLINE DATA PATHS - Replace with your actual offline data paths
+  offline_train_files: 
+    - /path/to/your/offline_train_trajectories.jsonl
+  offline_val_files:
+    - /path/to/your/offline_val_trajectories.jsonl
+  
+  # Batch size settings optimized for offline training
+  train_batch_size: 64    # Smaller batch size for stable offline learning
+  val_batch_size: 32      # Validation batch size
+  
+  # Token length settings
+  max_prompt_length: 1024
+  max_response_length: 512
+  
+  # Data processing settings
+  shuffle: true
+  filter_overlong_prompts: true
+
+# Algorithm configuration optimized for offline RL
+algorithm:
+  # 🎯 OFFLINE RL OPTIMIZED SETTINGS
+  adv_estimator: grpo  # GRPO is recommended for offline RL (also try: reinforce_plus_plus)
+  gamma: 0.99          # Discount factor
+  lam: 0.95           # GAE lambda (if using GAE)
+  
+  # KL divergence control - important for offline RL to prevent policy drift
+  use_kl_in_reward: true
+  kl_penalty: kl
+  kl_ctrl:
+    type: adaptive      # Adaptive KL control for offline training
+    kl_coef: 0.01      # Higher KL coefficient for conservative updates
+    horizon: 1000
+    target_kl: 0.05    # Lower target KL for more conservative updates
+  
+  # 🎯 Offline RL specific parameters
+  offline_rl:
+    behavior_cloning_coef: 0.1    # Behavior cloning loss coefficient (0.0-1.0)
+    importance_sampling_clip: 1.5  # Conservative importance sampling clipping
+
+# Actor/Policy configuration for offline training
+actor_rollout_ref:
+  actor:
+    # 🎯 CONSERVATIVE LEARNING RATES FOR OFFLINE RL
+    optim:
+      lr: 1e-7           # Much lower learning rate for stable offline learning
+      weight_decay: 0.01 # Regularization to prevent overfitting
+    
+    # Conservative PPO settings
+    ppo_mini_batch_size: 16      # Smaller mini-batch size
+    ppo_micro_batch_size_per_gpu: 2
+    
+    # Clipping settings for conservative updates
+    clip_ratio: 0.1              # Lower clip ratio for conservative policy updates
+    
+    # Loss aggregation
+    loss_agg_mode: seq-mean-token-mean
+    
+    # KL loss settings (if enabled)
+    use_kl_loss: false
+    kl_loss_coef: 0.01
+    
+  # Model configuration
+  model:
+    path: google/gemma-2-2b-it  # Replace with your model path
+    use_remove_padding: false
+    
+  # Rollout configuration (used mainly for validation in offline mode)
+  rollout:
+    temperature: 0.7
+    top_p: 0.9
+    max_new_tokens: 512
+    
+    # Validation generation settings
+    val_kwargs:
+      temperature: 0.1  # Lower temperature for deterministic validation
+      top_p: 0.95
+      do_sample: true
+      n: 1              # Single generation per validation prompt
+
+# Critic configuration for value function learning
+critic:
+  optim:
+    lr: 1e-6            # Conservative learning rate for critic
+    weight_decay: 0.01
+  
+  ppo_mini_batch_size: 16
+  ppo_micro_batch_size_per_gpu: 2
+  
+  model:
+    path: google/gemma-2-2b-it  # Same model as actor or separate critic model
+    use_remove_padding: false
+
+# Reward model configuration (if using model-based rewards)
+reward_model:
+  enable: false  # Set to true if using a separate reward model
+  strategy: fsdp
+  
+# Training infrastructure settings
+trainer:
+  n_gpus_per_node: 2
+  nnodes: 1
+  
+  # Logging configuration
+  logger: ['console', 'wandb']
+  project_name: 'offline_rl_experiment'
+  experiment_name: 'offline_ppo_training'
+  
+  # Checkpoint and validation settings
+  default_local_dir: ./checkpoints/offline_rl
+  default_hdfs_dir: null
+  
+  # Validation data logging
+  log_val_generations: 5      # Number of validation samples to log
+  validation_data_dir: ./validation_outputs
+  
+  # Checkpoint management
+  max_actor_ckpt_to_keep: 3
+  max_critic_ckpt_to_keep: 3
+
+# Ray initialization settings
+ray_init:
+  num_cpus: 16
+
+# Data format documentation:
+# 
+# Expected JSONL format for offline training data:
+# {
+#   "trajectory_id": "unique_identifier",
+#   "output": {
+#     "history": [
+#       {"role": "user", "content": "What is 2+2?"},
+#       {"role": "agent", "content": "2+2 equals 4."}
+#     ],
+#     "result": {
+#       "reward": 1.0,
+#       "success": true
+#     }
+#   }
+# }
+#
+# Alternative simplified format:
+# {
+#   "history": [
+#     {"role": "user", "content": "Question"},
+#     {"role": "agent", "content": "Answer"}
+#   ],
+#   "reward": 1.0
+# }
+
+# Training Tips for Offline RL:
+# 1. Use lower learning rates (1e-7 to 1e-6) to prevent policy drift
+# 2. Enable KL penalties to keep policy close to behavior policy  
+# 3. Use GRPO or reinforce_plus_plus for advantage estimation
+# 4. Consider behavior cloning coefficient > 0 for very conservative training
+# 5. Monitor validation metrics closely for overfitting
+# 6. Start with smaller batch sizes and increase gradually
+# 7. Use lower clip ratios (0.1-0.2) for more conservative updates 

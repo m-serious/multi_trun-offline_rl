@@ -302,13 +302,13 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
-        self.is_offline_mode = is_offline_mode # Added
+        self.is_offline_mode = is_offline_mode  # Flag for offline RL mode
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
-        # In offline mode, hybrid engine's rollout part is not used for training data generation
-        # assert self.hybrid_engine, "Currently, only support hybrid engine" # This might be too strict for pure offline
-
-        if self.hybrid_engine and not self.is_offline_mode: # Only assert if online
+        # In offline mode, hybrid engine's rollout component is primarily used for validation
+        # rather than training data generation, so we don't enforce this requirement for offline mode
+        
+        if self.hybrid_engine and not self.is_offline_mode:  # Only assert for online mode
             assert Role.ActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"
 
         self.role_worker_mapping = role_worker_mapping
@@ -338,7 +338,7 @@ class RayPPOTrainer:
         else:
             raise NotImplementedError
 
-        self._validate_config() # May need adjustment for offline mode
+        self._validate_config()  # Validates configuration for both online and offline modes
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
     def _validate_config(self):
@@ -347,10 +347,10 @@ class RayPPOTrainer:
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
         if self.is_offline_mode:
-            # Minimum offline safety check（可根据实际需要保留一些）
+            # Minimum validation for offline mode - ensure batch size compatibility
             assert config.data.train_batch_size >= config.actor_rollout_ref.actor.ppo_mini_batch_size, \
-                f"train_batch_size ({config.data.train_batch_size}) must ≥ ppo_mini_batch_size ({config.actor_rollout_ref.actor.ppo_mini_batch_size})"
-            print("[validate_config] Offline mode: skipped online-specific validation.")
+                f"train_batch_size ({config.data.train_batch_size}) must be >= ppo_mini_batch_size ({config.actor_rollout_ref.actor.ppo_mini_batch_size})"
+            print("[validate_config] Offline mode: skipped online-specific validation checks.")
             return
     
         # 1. Check total batch size for data correctness
@@ -461,7 +461,7 @@ class RayPPOTrainer:
                 assert config.actor_rollout_ref.rollout.multi_turn.tool_config_path is not None, "tool_config_path must be set when enabling multi_turn with tool, due to no role-playing support"
             assert config.algorithm.adv_estimator in [AdvantageEstimator.GRPO], "only GRPO is tested for multi-turn with tool"
 
-        print("[validate_config] All configuration checks passed successfully!")
+        print("[validate_config] All configuration validation checks passed successfully!")
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler):
         """
@@ -1053,67 +1053,73 @@ class RayPPOTrainer:
                     
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                    # Rewards: In offline mode, rewards are typically part of the dataset.
-                    # We'll place them into "token_level_scores" as the PPO pipeline expects.
-                    # The original `compute_reward` function might be skipped or adapted.
+                    # Reward Processing: Use dataset rewards in offline mode, compute new rewards in online mode
                     with _timer("reward_setup", timing_raw):
                         if self.is_offline_mode:
+                            # Offline mode: Use pre-defined rewards from the dataset
                             if "rewards" not in batch.batch:
-                                raise ValueError("Offline batch must contain 'rewards'.")
-                            # Assuming batch.batch["rewards"] are per-sequence scores.
-                            # If they are token-level, great. If scalar, expand them or adjust.
-                            # For simplicity, let's assume they are already shaped as token_level_scores
-                            # or can be directly used. If scalar, you might need to assign it to the last token.
-                            # This part is highly dependent on your offline data's reward structure.
-                            # A common case: scalar reward per (s,a) transition.
-                            # We need to make it compatible with `token_level_scores` (batch_size, seq_len)
-                            
-                            scalar_rewards = batch.batch["rewards"] # Assuming (batch_size,) or (batch_size, 1)
+                                raise ValueError("Offline mode requires batch to contain 'rewards' field")
+                                
+                            # Distribute scalar rewards to token level, typically assigned to the last valid token
+                            scalar_rewards = batch.batch["rewards"]  # Expected shape: (batch_size,) or (batch_size, 1)
                             response_mask_for_reward = batch.batch["response_mask"]
-                            token_level_scores = torch.zeros_like(response_mask_for_reward, dtype=scalar_rewards.dtype, device=scalar_rewards.device)
+                            token_level_scores = torch.zeros_like(
+                                response_mask_for_reward, 
+                                dtype=scalar_rewards.dtype, 
+                                device=scalar_rewards.device
+                            )
                             
-                            # Distribute scalar reward to the masked tokens (e.g., last token or mean)
-                            # Example: assign to the last unmasked token in response
+                            # Find the position of the last valid token in each sequence
                             last_indices = torch.sum(response_mask_for_reward, dim=1) - 1
                             valid_indices = last_indices >= 0
                             
                             if scalar_rewards.ndim == 1:
-                                scalar_rewards = scalar_rewards.unsqueeze(-1) # Make it (batch_size, 1)
-
+                                scalar_rewards = scalar_rewards.unsqueeze(-1)
+                            
+                            # Assign rewards to the last valid tokens
                             if valid_indices.any():
-                                token_level_scores[torch.arange(batch.batch.batch_size[0])[valid_indices], last_indices[valid_indices]] = scalar_rewards[valid_indices].squeeze(-1)
+                                token_level_scores[torch.arange(len(valid_indices))[valid_indices], last_indices[valid_indices]] = scalar_rewards[valid_indices].squeeze(-1)
                             
                             batch.batch["token_level_scores"] = token_level_scores
-                            reward_extra_infos_dict = {} # No extra infos from offline data unless loaded
-                        else: # Online mode
-                            if self.use_rm: # Model-based RM
-                                reward_tensor_dp = self.rm_wg.compute_rm_score(batch) # DataProto expected
-                                batch = batch.union(reward_tensor_dp) # reward_tensor is in batch.batch now
-                                reward_tensor = batch.batch["reward_tensor"] # Assuming this key
-                                reward_extra_infos_dict = {} # Or get from rm_wg if it provides
+                            reward_extra_infos_dict = {}
+                            print(f"[OFFLINE] Processed {valid_indices.sum().item()} valid reward samples")
+                            
+                        else: 
+                            # Online mode: Compute new rewards
+                            if self.use_rm:
+                                reward_tensor_dp = self.rm_wg.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor_dp)
+                                reward_extra_infos_dict = {}
                             elif self.config.reward_model.launch_reward_fn_async:
                                 future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
-                                # Reward will be fetched later
-                            else: # Rule-based RM or direct function
+                            else:
                                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-                            
-                            # This assignment was inside the async block, moving out for clarity if not async
-                            if not (self.is_offline_mode or self.config.reward_model.launch_reward_fn_async or self.use_rm) :
                                 batch.batch["token_level_scores"] = reward_tensor
 
-                    # Compute log_probs for actions from the batch (dataset actions in offline mode)
-                    # This computes log pi_current(a_dataset | s_dataset)
-                    with _timer("old_log_prob", timing_raw): # Renaming for clarity, this is current policy's logprob of data actions
-                        # The 'batch' already contains 'responses' (actions from data) and 'input_ids' (states)
+                    # Policy Evaluation: Compute current policy's log probabilities on dataset actions
+                    # This is the core of offline RL - evaluating log π_current(a_data | s_data)
+                    with _timer("policy_evaluation", timing_raw):
+                        if self.is_offline_mode:
+                            print(f"[OFFLINE] Computing current policy log probabilities on {batch.batch.batch_size[0]} offline samples")
+                        
+                        # Batch contains 'responses' (actions from data) and 'input_ids' (states)
                         log_prob_output = self.actor_rollout_wg.compute_log_prob(batch)
+                        
+                        # Compute entropy loss
                         entropys = log_prob_output.batch["entropys"]
-                        response_masks_for_entropy = batch.batch["response_mask"] # Use the same mask
+                        response_masks_for_entropy = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks_for_entropy, loss_agg_mode=loss_agg_mode)
+                        
                         log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+                        if self.is_offline_mode:
+                            log_prob_metrics["offline/policy_entropy"] = entropy_loss.detach().item()
+                        
                         metrics.update(log_prob_metrics)
                         log_prob_output.batch.pop("entropys")
-                        batch = batch.union(log_prob_output) # Adds "old_log_probs" (log pi_current(a_data|s_data))
+                        
+                        # Add current policy's log probabilities to batch
+                        batch = batch.union(log_prob_output)  # Adds "old_log_probs" = log π_current(a_data|s_data)
 
 
                     if self.use_reference_policy:
@@ -1128,41 +1134,55 @@ class RayPPOTrainer:
                             values = self.critic_wg.compute_values(batch) # Computes V_current(s_data)
                             batch = batch.union(values)
 
-                    with _timer("adv", timing_raw):
-                        if not self.is_offline_mode and self.config.reward_model.launch_reward_fn_async: # Fetch async reward if online
+                    # Advantage Computation: Calculate advantages and returns based on rewards
+                    with _timer("advantage_computation", timing_raw):
+                        # Online mode: Fetch asynchronous rewards
+                        if not self.is_offline_mode and self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                            batch.batch["token_level_scores"] = reward_tensor # Place it now
+                            batch.batch["token_level_scores"] = reward_tensor
 
-                        # If offline, reward_extra_infos_dict is likely empty unless loaded
-                        if not self.is_offline_mode and reward_extra_infos_dict: # Online mode
+                        # Update additional reward information (mainly for online mode)
+                        if not self.is_offline_mode and reward_extra_infos_dict:
                              batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
                         
+                        # Apply KL penalty (applicable to both online and offline modes)
                         if self.config.algorithm.use_kl_in_reward:
-                            # apply_kl_penalty needs "old_log_probs" (current policy) and "ref_log_prob"
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, 
                                 kl_ctrl=self.kl_ctrl_in_reward, 
                                 kl_penalty=self.config.algorithm.kl_penalty,
                                 multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable
-                                )
+                            )
                             metrics.update(kl_metrics)
+                            
+                            if self.is_offline_mode:
+                                metrics["offline/kl_penalty_applied"] = True
                         else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"] # Rewards are scores if no KL penalty in reward
+                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        # Compute advantages
-                        # compute_advantage needs "token_level_rewards", "values" (if GAE), "response_mask"
-                        # For multi-turn, it internally uses loss_mask if multi_turn=True
+                        # Compute advantages and returns
+                        print(f"[{'OFFLINE' if self.is_offline_mode else 'ONLINE'}] Computing advantages using {self.config.algorithm.adv_estimator} estimator")
+                        
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
-                            # num_repeat might not be relevant for offline data unless data was generated with n repeats
-                            # and you want to process it that way. Defaulting to 1 for offline.
                             num_repeat=1 if self.is_offline_mode else self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                         )
+                        
+                        # Add offline mode advantage statistics
+                        if self.is_offline_mode:
+                            advantages = batch.batch["advantages"]
+                            returns = batch.batch["returns"]
+                            metrics.update({
+                                "offline/advantage_mean": torch.mean(advantages).item(),
+                                "offline/advantage_std": torch.std(advantages).item(),
+                                "offline/return_mean": torch.mean(returns).item(),
+                                "offline/return_std": torch.std(returns).item(),
+                            })
 
                     # update critic
                     if self.use_critic:
@@ -1195,11 +1215,13 @@ class RayPPOTrainer:
                             # ... (original dumping logic) ...
                             pass
 
-                    # validate
+                    # Model Validation
                     if self.val_reward_fn is not None and self.val_dataloader and self.config.trainer.test_freq > 0 and \
                         (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
-                            with _timer("testing", timing_raw):
-                                val_metrics: dict = self._validate() # _validate might also need offline mode adaptation
+                            with _timer("validation", timing_raw):
+                                if self.is_offline_mode:
+                                    print(f"[OFFLINE] Starting validation evaluation on current policy...")
+                                val_metrics: dict = self._validate()
                                 if is_last_step:
                                     last_val_metrics = val_metrics
                             metrics.update(val_metrics)
