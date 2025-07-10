@@ -34,25 +34,102 @@ from verl.utils.model import compute_position_id_with_mask
 logger = logging.getLogger(__name__)
 
 
-def collate_fn(data_list: list[dict]) -> dict:
-    """Collate a batch of data."""
-    tensors = defaultdict(list)
-    non_tensors = defaultdict(list)
-
-    for data in data_list:
-        for key, val in data.items():
-            if isinstance(val, torch.Tensor):
-                tensors[key].append(val)
+def collate_fn(batch_data):
+    """
+    Collate function for RL dataset.
+    
+    Handles both online RL data (RLHFDataset) and offline RL data (OfflineRLDataset).
+    """
+    batch_tensor = {}
+    batch_non_tensor = defaultdict(list)
+    
+    # Determine if this is offline RL data by checking for behavior_log_probs or trajectory_id
+    is_offline = any("behavior_log_probs" in item or "trajectory_id" in item for item in batch_data)
+    
+    for item in batch_data:
+        for key, value in item.items():
+            if isinstance(value, torch.Tensor):
+                if key not in batch_tensor:
+                    batch_tensor[key] = []
+                batch_tensor[key].append(value)
             else:
-                non_tensors[key].append(val)
-
-    for key, val in tensors.items():
-        tensors[key] = torch.stack(val, dim=0)
-
-    for key, val in non_tensors.items():
-        non_tensors[key] = np.array(val, dtype=object)
-
-    return {**tensors, **non_tensors}
+                batch_non_tensor[key].append(value)
+    
+    # Stack or pad tensor fields
+    for key, value_list in batch_tensor.items():
+        if key in ["input_ids", "attention_mask", "responses", "response_attention_mask", "loss_mask", "behavior_log_probs"]:
+            # Pad sequences to same length
+            max_len = max(v.size(0) for v in value_list)
+            padded_tensors = []
+            
+            for tensor in value_list:
+                if tensor.size(0) < max_len:
+                    # Pad with zeros (or appropriate pad tokens for input_ids)
+                    pad_value = 0
+                    if key == "input_ids":
+                        # Use tokenizer's pad_token_id if available
+                        pad_value = getattr(batch_data[0].get('tokenizer', None), 'pad_token_id', 0) or 0
+                    
+                    padding = torch.full((max_len - tensor.size(0),), pad_value, dtype=tensor.dtype)
+                    padded_tensor = torch.cat([tensor, padding])
+                else:
+                    padded_tensor = tensor
+                
+                padded_tensors.append(padded_tensor)
+            
+            batch_tensor[key] = torch.stack(padded_tensors)
+        else:
+            # For other tensor fields (like rewards), just stack
+            batch_tensor[key] = torch.stack(value_list)
+    
+    # Handle offline RL specific fields
+    if is_offline:
+        # Ensure behavior_log_probs is handled correctly
+        if "behavior_log_probs" not in batch_tensor:
+            # If not present, set to None (will be handled in training loop)
+            batch_tensor["behavior_log_probs"] = None
+        
+        # For offline RL, we often need to combine input_ids and responses
+        if "input_ids" in batch_tensor and "responses" in batch_tensor:
+            input_ids = batch_tensor["input_ids"]
+            responses = batch_tensor["responses"]
+            input_attention_mask = batch_tensor.get("attention_mask")
+            response_attention_mask = batch_tensor.get("response_attention_mask")
+            
+            # Create combined sequences for full context
+            # Combined format: [input_ids] + [responses]
+            batch_size = input_ids.size(0)
+            input_len = input_ids.size(1)
+            response_len = responses.size(1)
+            
+            # Create combined input_ids and attention_mask
+            combined_input_ids = torch.cat([input_ids, responses], dim=1)
+            
+            if input_attention_mask is not None and response_attention_mask is not None:
+                combined_attention_mask = torch.cat([input_attention_mask, response_attention_mask], dim=1)
+            else:
+                # Fallback: create attention mask based on non-zero tokens
+                combined_attention_mask = (combined_input_ids != 0).long()
+            
+            # Create loss_mask: no loss on input tokens, loss on response tokens
+            loss_mask = torch.cat([
+                torch.zeros(batch_size, input_len, dtype=torch.long),  # No loss on input
+                torch.ones(batch_size, response_len, dtype=torch.long)  # Loss on response
+            ], dim=1)
+            
+            # Update batch with combined sequences
+            batch_tensor["input_ids"] = combined_input_ids
+            batch_tensor["attention_mask"] = combined_attention_mask
+            batch_tensor["loss_mask"] = loss_mask
+            
+            # Keep original responses for response_mask computation
+            # batch_tensor["responses"] remains as is
+    
+    # Return in the format expected by DataProto.from_single_dict
+    result = {}
+    result.update(batch_tensor)
+    result.update(dict(batch_non_tensor))
+    return result
 
 
 class RLHFDataset(Dataset):
@@ -487,51 +564,128 @@ import os
 
 class OfflineRLDataset(Dataset):
     """
-    Offline Reinforcement Learning Dataset for processing pre-collected trajectory data.
+    Offline RL Dataset for loading pre-collected trajectories with rewards and actions.
     
-    This dataset is specifically designed for offline RL training where we learn from
-    fixed trajectory data without online environment interaction.
+    Supports two modes for behavior policy log probabilities:
+    1. Load pre-computed log probabilities from dataset (behavior_log_probs field)
+    2. Compute log probabilities using a fixed behavior policy model during loading
     
-    Data Format Requirements:
-    - JSONL format with one JSON object per line
-    - Each record contains trajectory history and reward information
-    - Supports multi-turn conversation format
-    - Automatically generates loss_mask for multi-turn training
-    
-    Args:
-        data_files (str or List[str]): Path(s) to offline trajectory data files
-        tokenizer: HuggingFace tokenizer instance
-        max_prompt_length (int): Maximum length for prompt/observation tokens
-        max_response_length (int): Maximum length for response/action tokens
+    Expected data format for JSONL files:
+    {
+        "trajectory_id": "unique_id",
+        "output": {
+            "history": [
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "agent", "content": "2+2 equals 4."}
+            ],
+            "result": {
+                "reward": 1.0,
+                "success": true
+            },
+            "behavior_log_probs": [0.1, 0.2, 0.05, ...] // Optional: pre-computed behavior policy log probs
+        }
+    }
     """
-    def __init__(self, data_files, tokenizer, max_prompt_length=4096, max_response_length=1024):
+    
+    def __init__(
+        self, 
+        data_files: list, 
+        tokenizer, 
+        max_prompt_length: int, 
+        max_response_length: int,
+        behavior_policy_mode: str = "fixed_model",  # "dataset" or "fixed_model" 
+        behavior_model_path: str = None,  # Path to behavior policy model (for fixed_model mode)
+        device: str = "cuda"
+    ):
+        """
+        Args:
+            data_files: List of JSONL file paths containing offline trajectories
+            tokenizer: Tokenizer for processing text
+            max_prompt_length: Maximum length for input prompts
+            max_response_length: Maximum length for responses
+            behavior_policy_mode: How to obtain behavior policy log probabilities
+                - "dataset": Load pre-computed log probs from dataset
+                - "fixed_model": Compute using a fixed behavior policy model
+            behavior_model_path: Path to behavior policy model (required for fixed_model mode)
+            device: Device for behavior model computation
+        """
+        self.data_files = data_files
         self.tokenizer = tokenizer
         self.max_prompt_length = max_prompt_length
         self.max_response_length = max_response_length
-        self.data = []
+        self.behavior_policy_mode = behavior_policy_mode
+        self.behavior_model_path = behavior_model_path
+        self.device = device
         
-        # Ensure sep_token exists for separating prompt and response
-        if not hasattr(tokenizer, 'sep_token') or tokenizer.sep_token is None:
-            tokenizer.sep_token = "[SEP]"
-            tokenizer.add_special_tokens({'sep_token': '[SEP]'})
-            print(f"[INFO] Set sep_token to: {tokenizer.sep_token}")
+        # Initialize behavior policy model if needed
+        self.behavior_model = None
+        if behavior_policy_mode == "fixed_model":
+            self._init_behavior_model()
         
-        if isinstance(data_files, str):
-            data_files = [data_files]
+        # Load and process all data
+        self.samples = []
+        self._load_all_data()
         
-        print(f"[INFO] Loading {len(data_files)} offline data files: {data_files}")
+        print(f"Loaded {len(self.samples)} offline RL samples")
+        print(f"Behavior policy mode: {behavior_policy_mode}")
         
-        for fp in data_files:
-            if not os.path.exists(fp):
-                print(f"[ERROR] File not found: {fp}")
-                continue
-                
+    def _init_behavior_model(self):
+        """Initialize behavior policy model for computing log probabilities"""
+        if not self.behavior_model_path:
+            raise ValueError("behavior_model_path must be provided when behavior_policy_mode='fixed_model'")
+            
+        try:
+            from transformers import AutoModelForCausalLM
+            
+            print(f"Loading behavior policy model from {self.behavior_model_path}")
+            self.behavior_model = AutoModelForCausalLM.from_pretrained(
+                self.behavior_model_path,
+                torch_dtype=torch.float16,
+                device_map=self.device,
+                trust_remote_code=True
+            )
+            self.behavior_model.eval()
+            print("Behavior policy model loaded successfully")
+            
+        except Exception as e:
+            print(f"Failed to load behavior model: {e}")
+            raise
+    
+    def _compute_behavior_log_probs(self, input_ids: torch.Tensor, response_ids: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+        """Compute behavior policy log probabilities for given inputs and responses"""
+        if self.behavior_model is None:
+            raise ValueError("Behavior model not initialized")
+            
+        # Concatenate input and response
+        full_input_ids = torch.cat([input_ids, response_ids], dim=-1)
+        
+        with torch.no_grad():
+            # Get logits from behavior model
+            outputs = self.behavior_model(full_input_ids)
+            logits = outputs.logits
+            
+            # Extract response logits (shift by 1 for next-token prediction)
+            response_logits = logits[:, input_ids.shape[-1]-1:-1]  # Shape: (batch_size, response_length, vocab_size)
+            
+            # Compute log probabilities
+            log_probs = torch.log_softmax(response_logits, dim=-1)
+            
+            # Extract log probabilities for actual response tokens
+            response_log_probs = torch.gather(
+                log_probs, 
+                dim=-1, 
+                index=response_ids.unsqueeze(-1)
+            ).squeeze(-1)  # Shape: (batch_size, response_length)
+            
+            # Apply response mask
+            response_log_probs = response_log_probs * response_mask
+            
+        return response_log_probs
+
+    def _load_all_data(self):
+        """Load and process all data files."""
+        for fp in self.data_files:
             self._load_file(fp)
-        
-        print(f"[INFO] Successfully loaded {len(self.data)} training samples")
-        
-        if not self.data:
-            raise ValueError(f"No valid samples loaded from {data_files}. Please check data format and file content.")
 
     def _load_file(self, filepath):
         """Load and parse trajectory data from a single file."""
@@ -540,38 +694,48 @@ class OfflineRLDataset(Dataset):
                 for line_idx, line in enumerate(f):
                     try:
                         record = json.loads(line.strip())
-                        self._process_record(record, filepath, line_idx)
+                        sample = self._process_record(record)
+                        if sample:
+                            self.samples.append(sample)
                     except json.JSONDecodeError as e:
                         print(f"[WARNING] Skipping invalid JSON line {filepath}:{line_idx}: {e}")
                         continue
         except FileNotFoundError:
             print(f"[ERROR] File not found: {filepath}")
 
-    def _process_record(self, record, filepath, line_idx):
-        """Process a single record to extract trajectory and reward information."""
-        # Extract trajectory data - support multiple data formats
-        trajectory = (
-            record.get("output", {}).get("result", {}).get("history", []) or
-            record.get("output", {}).get("history", []) or
-            record.get("history", []) or
-            []
-        )
-        
-        if not trajectory:
-            print(f"[WARNING] Empty trajectory {filepath}:{line_idx}")
-            return
-        
-        # Extract reward value - support multiple reward fields
-        reward = self._extract_reward(record)
-        
-        # Parse user-agent conversation pairs from trajectory
-        conversation_pairs = self._extract_conversation_pairs(trajectory)
-        
-        # Create training samples for each conversation pair
-        for pair_idx, (user_msg, agent_msg) in enumerate(conversation_pairs):
-            uid = f"{os.path.basename(filepath)}_{line_idx}_{pair_idx}"
-            sample = self._build_sample(user_msg, agent_msg, reward, uid)
-            self.data.append(sample)
+    def _process_record(self, record):
+        """Process a single record and extract required fields"""
+        try:
+            # Extract conversation history
+            output = record.get("output", {})
+            history = output.get("history", [])
+            
+            if not history:
+                return None
+                
+            # Extract reward/score
+            reward = self._extract_reward(output)
+            
+            # Process conversation pairs
+            conversation_pairs = self._extract_conversation_pairs(history)
+            if not conversation_pairs:
+                return None
+            
+            # Extract behavior log probabilities if available in dataset
+            behavior_log_probs_raw = None
+            if self.behavior_policy_mode == "dataset":
+                behavior_log_probs_raw = output.get("behavior_log_probs", None)
+                if behavior_log_probs_raw is None:
+                    print(f"Warning: behavior_log_probs not found in dataset record, but behavior_policy_mode='dataset'")
+                    return None
+            
+            # Build the sample
+            sample = self._build_sample(conversation_pairs, reward, behavior_log_probs_raw)
+            return sample
+            
+        except Exception as e:
+            print(f"Error processing record: {e}")
+            return None
 
     def _extract_reward(self, record):
         """Extract reward value, supporting multiple reward formats."""
@@ -616,61 +780,89 @@ class OfflineRLDataset(Dataset):
         
         return pairs
 
-    def _build_sample(self, user_msg, agent_msg, reward, uid):
-        """Build a single training sample from user message and agent response."""
-        # Tokenize user message and agent response separately
-        user_tokens = self.tokenizer(
-            user_msg, 
-            truncation=True, 
-            add_special_tokens=False, 
-            max_length=self.max_prompt_length
+    def _build_sample(self, conversation_pairs, reward, behavior_log_probs_raw=None):
+        """Build a training sample from conversation pairs and reward"""
+        
+        # Combine all user inputs and agent responses for multi-turn
+        full_prompt = ""
+        full_response = ""
+        
+        for user_msg, agent_msg in conversation_pairs:
+            if full_prompt:
+                full_prompt += f"{self.tokenizer.sep_token}{user_msg}"
+            else:
+                full_prompt = user_msg
+            
+            if full_response:
+                full_response += f"{self.tokenizer.sep_token}{agent_msg}"
+            else:
+                full_response = agent_msg
+        
+        # Tokenize prompt and response
+        prompt_inputs = self.tokenizer(
+            full_prompt,
+            max_length=self.max_prompt_length,
+            truncation=True,
+            padding=False,
+            return_tensors="pt"
         )
         
-        agent_tokens = self.tokenizer(
-            agent_msg, 
-            truncation=True, 
-            add_special_tokens=False, 
-            max_length=self.max_response_length
+        response_inputs = self.tokenizer(
+            full_response,
+            max_length=self.max_response_length,
+            truncation=True,
+            padding=False,
+            return_tensors="pt"
         )
         
-        # Get separator tokens
-        sep_tokens = self.tokenizer(
-            self.tokenizer.sep_token, 
-            add_special_tokens=False
-        )["input_ids"]
+        prompt_ids = prompt_inputs["input_ids"].squeeze(0)
+        response_ids = response_inputs["input_ids"].squeeze(0)
         
-        # Combine input_ids: [user_tokens] + [SEP] + [agent_tokens]
-        input_ids = user_tokens["input_ids"] + sep_tokens + agent_tokens["input_ids"]
-        attention_mask = [1] * len(input_ids)
+        # Create masks
+        prompt_attention_mask = prompt_inputs["attention_mask"].squeeze(0)
+        response_attention_mask = response_inputs["attention_mask"].squeeze(0)
         
-        # loss_mask: compute loss only on agent response tokens
-        loss_mask = (
-            [0] * len(user_tokens["input_ids"]) +     # No loss on user tokens
-            [0] * len(sep_tokens) +                   # No loss on separator tokens  
-            [1] * len(agent_tokens["input_ids"])      # Compute loss on agent tokens
-        )
+        # Handle behavior log probabilities
+        behavior_log_probs = None
         
-        # Ensure total length doesn't exceed maximum
-        max_total_length = self.max_prompt_length + self.max_response_length
-        if len(input_ids) > max_total_length:
-            input_ids = input_ids[:max_total_length]
-            attention_mask = attention_mask[:max_total_length]
-            loss_mask = loss_mask[:max_total_length]
+        if self.behavior_policy_mode == "dataset" and behavior_log_probs_raw is not None:
+            # Load pre-computed behavior log probabilities from dataset
+            behavior_log_probs = torch.tensor(behavior_log_probs_raw, dtype=torch.float32)
+            
+            # Ensure correct length (truncate or pad to response length)
+            if len(behavior_log_probs) > len(response_ids):
+                behavior_log_probs = behavior_log_probs[:len(response_ids)]
+            elif len(behavior_log_probs) < len(response_ids):
+                # Pad with zeros
+                padding_length = len(response_ids) - len(behavior_log_probs)
+                behavior_log_probs = torch.cat([
+                    behavior_log_probs, 
+                    torch.zeros(padding_length, dtype=torch.float32)
+                ])
+                
+        elif self.behavior_policy_mode == "fixed_model":
+            # Compute behavior log probabilities using the fixed model
+            behavior_log_probs = self._compute_behavior_log_probs(
+                input_ids=prompt_ids.unsqueeze(0),
+                response_ids=response_ids.unsqueeze(0), 
+                response_mask=response_attention_mask.unsqueeze(0).float()
+            ).squeeze(0)
         
         return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "loss_mask": torch.tensor(loss_mask, dtype=torch.long),
-            "responses": torch.tensor(agent_tokens["input_ids"], dtype=torch.long),
-            "rewards": torch.tensor([reward], dtype=torch.float),
-            "uid": uid,
+            "input_ids": prompt_ids,
+            "attention_mask": prompt_attention_mask,
+            "responses": response_ids,
+            "response_attention_mask": response_attention_mask,
+            "rewards": torch.tensor(reward, dtype=torch.float32),
+            "behavior_log_probs": behavior_log_probs,  # Behavior policy log probabilities
+            "trajectory_id": f"offline_{len(self.samples)}"  # Unique identifier
         }
 
     def __len__(self):
-        return len(self.data)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        return self.samples[idx]
 
 # =======  替换结束 =======
 

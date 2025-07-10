@@ -1121,6 +1121,46 @@ class RayPPOTrainer:
                         # Add current policy's log probabilities to batch
                         batch = batch.union(log_prob_output)  # Adds "old_log_probs" = log π_current(a_data|s_data)
 
+                    # Behavior Policy Log Probabilities: Handle the key difference for offline RL
+                    with _timer("behavior_policy_setup", timing_raw):
+                        if self.is_offline_mode:
+                            # In offline RL, we need behavior policy log probabilities in "old_log_probs"
+                            # and current policy log probabilities for computing the policy gradient
+                            
+                            # Save current policy log probabilities for policy gradient computation
+                            current_log_probs = batch.batch["old_log_probs"].clone()
+                            
+                            if "behavior_log_probs" in batch.batch and batch.batch["behavior_log_probs"] is not None:
+                                # Scenario 1: Use behavior log probabilities from dataset or fixed model
+                                behavior_log_probs = batch.batch["behavior_log_probs"]
+                                print(f"[OFFLINE] Using behavior policy log probabilities from {'dataset' if hasattr(self, 'behavior_policy_mode') else 'fixed model'}")
+                                
+                                # Replace old_log_probs with behavior policy log probabilities
+                                batch.batch["old_log_probs"] = behavior_log_probs
+                                
+                                # Store current policy log probabilities separately for policy gradient
+                                batch.batch["current_log_probs"] = current_log_probs
+                                
+                                # Compute log probability ratio for offline importance sampling
+                                log_prob_ratio = current_log_probs - behavior_log_probs
+                                importance_weights = torch.exp(log_prob_ratio)
+                                
+                                # Clip importance weights for stability (common in offline RL)
+                                importance_weights = torch.clamp(importance_weights, min=0.1, max=10.0)
+                                batch.batch["importance_weights"] = importance_weights
+                                
+                                metrics.update({
+                                    "offline/behavior_log_prob_mean": torch.mean(behavior_log_probs * batch.batch["response_mask"]).item(),
+                                    "offline/current_log_prob_mean": torch.mean(current_log_probs * batch.batch["response_mask"]).item(),
+                                    "offline/importance_weight_mean": torch.mean(importance_weights * batch.batch["response_mask"]).item(),
+                                    "offline/importance_weight_max": torch.max(importance_weights * batch.batch["response_mask"]).item(),
+                                })
+                                
+                            else:
+                                # Fallback: Use current policy as behavior policy (like online RL)
+                                print(f"[OFFLINE] Warning: No behavior policy log probabilities available, using current policy")
+                                # In this case, old_log_probs remains as current policy log probabilities
+                                batch.batch["current_log_probs"] = current_log_probs
 
                     if self.use_reference_policy:
                         # compute reference log_prob

@@ -20,23 +20,30 @@ trainer:
 
 # Dataset configuration for offline training
 data:
-  # 🎯 OFFLINE DATA PATHS - Replace with your actual offline data paths
-  offline_train_files: 
-    - /path/to/your/offline_train_trajectories.jsonl
-  offline_val_files:
-    - /path/to/your/offline_val_trajectories.jsonl
+  offline_train_files: null  # REQUIRED: List of JSONL files containing offline trajectories
+  offline_val_files: null    # OPTIONAL: Validation files for offline RL
   
-  # Batch size settings optimized for offline training
-  train_batch_size: 64    # Smaller batch size for stable offline learning
-  val_batch_size: 32      # Validation batch size
+  # Behavior Policy Configuration - Choose one of two scenarios:
   
-  # Token length settings
-  max_prompt_length: 1024
-  max_response_length: 512
+  # Scenario 1: Load pre-computed behavior policy log probabilities from dataset
+  # behavior_policy_mode: "dataset"  # Use when dataset contains "behavior_log_probs" field
   
-  # Data processing settings
+  # Scenario 2: Compute behavior policy log probabilities using a fixed SFT model
+  behavior_policy_mode: "fixed_model"  # Use a fixed reference model as behavior policy
+  behavior_model_path: null  # REQUIRED for fixed_model mode: Path to behavior policy model
+  # Example: "microsoft/DialoGPT-medium" or path to your SFT checkpoint
+  
+  # Standard data processing parameters
+  max_prompt_length: 1024    # Maximum length for input prompts
+  max_response_length: 512   # Maximum length for agent responses
+  train_batch_size: 32       # Number of trajectories per training batch
+  val_batch_size: 64         # Number of trajectories per validation batch
+  device: "cuda"             # Device for behavior policy model computation
+  
+  # Data processing options
   shuffle: true
-  filter_overlong_prompts: true
+  dataloader_num_workers: 8
+  trust_remote_code: false
 
 # Algorithm configuration optimized for offline RL
 algorithm:

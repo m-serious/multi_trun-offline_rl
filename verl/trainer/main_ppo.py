@@ -261,12 +261,25 @@ def create_offline_rl_dataset(data_files, data_config, tokenizer, processor):
         tokenizer.add_special_tokens({'sep_token': '[SEP]'})
         print(f"[INFO] Set sep_token to {tokenizer.sep_token}")
 
+    # Configure behavior policy mode based on data_config
+    behavior_policy_mode = data_config.get("behavior_policy_mode", "fixed_model")  # "dataset" or "fixed_model"
+    behavior_model_path = data_config.get("behavior_model_path", None)  # Path to behavior model for fixed_model mode
+    
     print(f"Using OfflineRLDataset for offline RL.")
+    print(f"Behavior policy mode: {behavior_policy_mode}")
+    
+    if behavior_policy_mode == "fixed_model" and behavior_model_path is None:
+        print("Warning: behavior_policy_mode='fixed_model' but no behavior_model_path provided. Using current policy as behavior policy.")
+        behavior_policy_mode = "current_policy"  # Fallback mode
+    
     dataset = OfflineRLDataset(
         data_files=data_files,
         tokenizer=tokenizer,
         max_prompt_length=data_config.max_prompt_length,
-        max_response_length=data_config.max_response_length
+        max_response_length=data_config.max_response_length,
+        behavior_policy_mode=behavior_policy_mode,
+        behavior_model_path=behavior_model_path,
+        device=data_config.get("device", "cuda")
     )
     return dataset
 
